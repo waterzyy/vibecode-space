@@ -1,0 +1,8 @@
+# HTTP-сервер и OpenAI-совместимый API
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+# Протокол веб-приложения Gemini (StreamGenerate, SNlM0e, ротация __Secure-1PSIDTS).
+# Транспорт — curl_cffi (тянется автоматически), он же отдаёт штатные заголовки Chrome.
+gemini-webapi==2.1.1
+# Загрузка .env
+python-dotenv>=1.0,<2
