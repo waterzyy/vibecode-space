@@ -7,6 +7,10 @@
     GET  /v1/models             список моделей аккаунта
     GET  /healthz               состояние веб-сессии
 
+Function calling эмулируется текстом: веб-интерфейс Gemini не умеет вызывать инструменты
+через API. Схемы ``tools`` внедряются в системную инструкцию, а ответ модели разбирается
+по блокам ``<tool_call>{...}</tool_call>`` и возвращается как ``tool_calls``.
+
 Запуск: ``python server.py``. Настройки читаются из ``.env`` рядом с этим файлом.
 """
 
@@ -15,13 +19,14 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +57,10 @@ PREAMBLE = (
     "Continue it by writing ONLY the assistant's next reply to the last user message. "
     "Do not repeat the transcript and do not write role labels such as 'User:' or 'Assistant:'."
 )
+
+TOOL_OPEN = "<tool_call>"
+TOOL_CLOSE = "</tool_call>"
+_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*[ \t]*\n?(.*?)\n?```$", re.DOTALL)
 
 
 # ---------------------------------------------------------------------------
@@ -203,16 +212,147 @@ class ChatMessage(BaseModel):
     content: str | list[dict[str, Any]] | None = None
     name: str | None = None
     tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
-    # Поля вроде temperature, max_tokens, tools принимаются и игнорируются:
+    # Поля вроде temperature и max_tokens принимаются и игнорируются:
     # веб-интерфейс Gemini не предоставляет их управления.
     model_config = ConfigDict(extra="allow")
 
     model: str | None = None
     messages: list[ChatMessage] = Field(min_length=1)
     stream: bool = False
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Tools: разбор схем и выбора tool_choice
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+    @property
+    def required(self) -> tuple[str, ...]:
+        required = self.parameters.get("required", [])
+        if isinstance(required, list):
+            return tuple(item for item in required if isinstance(item, str))
+        return ()
+
+
+@dataclass(frozen=True)
+class ToolPlan:
+    """Что делать с инструментами в запросе.
+
+    ``specs`` пуст, если инструменты отключены (нет ``tools`` или ``tool_choice="none"``).
+    ``mode``: ``auto``, ``required`` или ``forced`` (вызов конкретной функции).
+    """
+
+    specs: dict[str, ToolSpec] = field(default_factory=dict)
+    mode: str = "auto"
+    forced: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.specs)
+
+
+def normalize_tools(raw_tools: list[dict[str, Any]] | None) -> dict[str, ToolSpec]:
+    """Превращает ``tools`` формата OpenAI в словарь имя -> ToolSpec."""
+    specs: dict[str, ToolSpec] = {}
+    for index, raw in enumerate(raw_tools or []):
+        tool_type = raw.get("type", "function")
+        function = raw.get("function")
+        if tool_type != "function" or not isinstance(function, dict):
+            raise BridgeError(
+                400,
+                f"tools[{index}]: поддерживается только {{'type': 'function', 'function': {{...}}}}.",
+                "invalid_request_error",
+            )
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise BridgeError(400, f"tools[{index}]: у функции не задано имя.", "invalid_request_error")
+        name = name.strip()
+        if name in specs:
+            raise BridgeError(400, f"Функция {name!r} объявлена в tools дважды.", "invalid_request_error")
+        parameters = function.get("parameters") or {"type": "object", "properties": {}}
+        if not isinstance(parameters, dict):
+            raise BridgeError(
+                400, f"tools[{index}]: parameters должен быть JSON-схемой (объектом).", "invalid_request_error"
+            )
+        description = function.get("description") or ""
+        specs[name] = ToolSpec(name=name, description=str(description), parameters=parameters)
+    return specs
+
+
+def resolve_tools(raw_tools: list[dict[str, Any]] | None, tool_choice: Any) -> ToolPlan:
+    specs = normalize_tools(raw_tools)
+
+    if tool_choice == "none":
+        return ToolPlan(mode="none")
+    if tool_choice in (None, "auto"):
+        return ToolPlan(specs=specs, mode="auto") if specs else ToolPlan()
+    if not specs:
+        raise BridgeError(400, "tool_choice задан, но tools пусты.", "invalid_request_error")
+    if tool_choice == "required":
+        return ToolPlan(specs=specs, mode="required")
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        forced = function.get("name") if isinstance(function, dict) else None
+        if tool_choice.get("type") == "function" and isinstance(forced, str):
+            if forced not in specs:
+                raise BridgeError(
+                    400, f"tool_choice ссылается на функцию {forced!r}, которой нет в tools.", "invalid_request_error"
+                )
+            return ToolPlan(specs={forced: specs[forced]}, mode="forced", forced=forced)
+    raise BridgeError(400, f"Неподдерживаемый tool_choice: {tool_choice!r}.", "invalid_request_error")
+
+
+def tool_instructions(plan: ToolPlan) -> str:
+    """Системная инструкция с описанием инструментов и строгим форматом вызова."""
+    schema = json.dumps(
+        [
+            {"name": spec.name, "description": spec.description, "parameters": spec.parameters}
+            for spec in plan.specs.values()
+        ],
+        indent=2,
+        ensure_ascii=False,
+    )
+    if plan.mode == "required":
+        requirement = "In this reply you MUST call one of the functions listed below."
+    elif plan.mode == "forced":
+        requirement = f'In this reply you MUST call the function "{plan.forced}".'
+    else:
+        requirement = (
+            "Call a function only when it is needed to answer. Otherwise answer normally in plain text, "
+            "without any <tool_call> tags."
+        )
+    return "\n".join(
+        [
+            "## Tool calling",
+            "You can call the functions listed below. Calls are written as plain text in exactly this form:",
+            "<tool_call>",
+            '{"name": "<function_name>", "arguments": {<json arguments>}}',
+            "</tool_call>",
+            "Rules:",
+            "- Inside <tool_call> write ONLY the JSON object. Put no other text inside the tags.",
+            "- If you call a function, write no text before or after the <tool_call> blocks.",
+            "- To call several independent functions, write several <tool_call> blocks one after another.",
+            "- Use only the function names listed below. The arguments must match the function's JSON Schema.",
+            "- Never invent a function result. The result arrives later as a message 'Tool Result (...)'; "
+            "continue the task from it.",
+            requirement,
+            "",
+            "Available functions (JSON):",
+            schema,
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -241,38 +381,89 @@ def message_text(message: ChatMessage) -> str:
     return "\n".join(texts)
 
 
-def build_prompt(messages: list[ChatMessage]) -> str:
+def render_call_block(name: str, arguments: Any) -> str:
+    """Вызов инструмента из истории в том же формате, который просим у модели."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            pass  # оставляем строку как есть
+    payload = json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
+    return f"{TOOL_OPEN}\n{payload}\n{TOOL_CLOSE}"
+
+
+def _history_calls(message: ChatMessage) -> list[tuple[str, str, Any]]:
+    """Вызовы из поля tool_calls сообщения assistant: (id, имя, аргументы)."""
+    calls: list[tuple[str, str, Any]] = []
+    for raw in message.tool_calls or []:
+        function = raw.get("function") if isinstance(raw, dict) else None
+        if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+            continue
+        calls.append((str(raw.get("id") or ""), function["name"], function.get("arguments", {})))
+    return calls
+
+
+def build_prompt(messages: list[ChatMessage], plan: ToolPlan | None = None) -> str:
     """Собирает промпт для Gemini из списка сообщений OpenAI.
 
-    Единственное сообщение user без system отправляется как есть. Иначе история
-    склеивается в транскрипт с системными инструкциями, а модели выдаётся указание
-    ответить только на последнее сообщение пользователя.
+    Одиночное сообщение user без system и без tools отправляется как есть. Иначе история
+    склеивается в транскрипт: системные инструкции (при наличии tools — описание функций
+    первым блоком), реплики пользователя, ответы ассистента, вызовы инструментов и результаты.
     """
+    plan = plan or ToolPlan()
     system_parts: list[str] = []
-    turns: list[tuple[str, str]] = []
+    if plan.enabled:
+        system_parts.append(tool_instructions(plan))
+
+    turns: list[str] = []
+    turn_roles: list[str] = []
+    call_names: dict[str, str] = {}  # tool_call_id -> имя функции, из истории assistant
+
     for message in messages:
         role = message.role
-        text = message_text(message).strip()
         if role in {"system", "developer"}:
+            text = message_text(message).strip()
             if text:
                 system_parts.append(text)
-        elif role in {"user", "assistant", "tool"}:
+        elif role == "user":
+            text = message_text(message).strip()
             if text:
-                turns.append((role, text))
+                turns.append(f"User: {text}")
+                turn_roles.append("user")
+        elif role == "assistant":
+            parts: list[str] = []
+            text = message_text(message).strip()
+            if text:
+                parts.append(text)
+            for call_id, name, arguments in _history_calls(message):
+                if call_id:
+                    call_names[call_id] = name
+                parts.append(render_call_block(name, arguments))
+            if parts:
+                turns.append("Assistant: " + "\n".join(parts))
+                turn_roles.append("assistant")
+        elif role in {"tool", "function"}:
+            text = message_text(message).strip()
+            label = message.name or call_names.get(message.tool_call_id or "") or "unknown"
+            if message.tool_call_id:
+                header = f"Tool Result ({label} / {message.tool_call_id})"
+            else:
+                header = f"Tool Result ({label})"
+            turns.append(f"{header}: {text}")
+            turn_roles.append("tool")
         else:
             raise BridgeError(400, f"Неизвестная роль сообщения: {role!r}.", "invalid_request_error")
 
     if not turns:
         raise BridgeError(400, "В messages нет непустых сообщений user, assistant или tool.", "invalid_request_error")
 
-    if len(turns) == 1 and turns[0][0] == "user" and not system_parts:
-        return turns[0][1]
+    if len(turns) == 1 and turn_roles == ["user"] and not system_parts:
+        return turns[0][len("User: ") :]
 
-    labels = {"user": "User", "assistant": "Assistant", "tool": "Tool result"}
     blocks = [PREAMBLE]
     if system_parts:
         blocks.append("### System instructions\n" + "\n\n".join(system_parts))
-    blocks.append("### Conversation\n" + "\n\n".join(f"{labels[role]}: {text}" for role, text in turns))
+    blocks.append("### Conversation\n" + "\n\n".join(turns))
     blocks.append("Assistant:")
     return "\n\n".join(blocks)
 
@@ -286,6 +477,154 @@ def normalize_model_name(requested: str | None) -> str | None:
             name = name[len(prefix) :]
             break
     return name or None
+
+
+# ---------------------------------------------------------------------------
+# Разбор ответа модели: <tool_call> -> tool_calls
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ContentEvent:
+    text: str
+
+
+@dataclass(frozen=True)
+class ToolCallEvent:
+    index: int
+    id: str
+    name: str
+    arguments: str  # JSON-строка, как в OpenAI API
+
+
+DetectorEvent = ContentEvent | ToolCallEvent
+
+
+def parse_tool_call(body: str, specs: dict[str, ToolSpec]) -> tuple[str, str] | None:
+    """Разбирает содержимое блока <tool_call>. Возвращает (имя, JSON аргументов) или None.
+
+    None означает, что блок невалиден: неверный JSON, неизвестная функция, аргументы не
+    объект или не хватает обязательных полей.
+    """
+    text = body.strip()
+    fence = _CODE_FENCE_RE.match(text)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("name")
+    if not isinstance(name, str) or name not in specs:
+        return None
+    arguments: Any = payload.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    if any(key not in arguments for key in specs[name].required):
+        return None
+    return name, json.dumps(arguments, ensure_ascii=False)
+
+
+def _partial_tag_len(text: str, tag: str) -> int:
+    """Длина самого длинного хвоста text, который может оказаться началом tag."""
+    for size in range(min(len(tag) - 1, len(text)), 0, -1):
+        if text.endswith(tag[:size]):
+            return size
+    return 0
+
+
+class ToolCallDetector:
+    """Потоковый детектор блоков <tool_call>.
+
+    Текст вне блоков отдаётся сразу; задерживаются только символы, которые могут быть
+    началом открывающего тега. Содержимое блока копится до закрывающего тега. Валидный блок
+    превращается в ToolCallEvent, невалидный возвращается обычным текстом (ContentEvent).
+    Если ``specs`` пуст, детектор работает как прозрачный проход.
+    """
+
+    def __init__(self, specs: dict[str, ToolSpec] | None = None) -> None:
+        self._specs = specs or {}
+        self._pending = ""
+        self._in_call = False
+        self.calls_emitted = 0
+
+    def feed(self, text: str) -> list[DetectorEvent]:
+        if not text:
+            return []
+        if not self._specs:
+            return [ContentEvent(text)]
+        self._pending += text
+        return self._drain(final=False)
+
+    def finish(self) -> list[DetectorEvent]:
+        if not self._specs:
+            return []
+        return self._drain(final=True)
+
+    def _drain(self, final: bool) -> list[DetectorEvent]:
+        events: list[DetectorEvent] = []
+        while True:
+            if self._in_call:
+                end = self._pending.find(TOOL_CLOSE)
+                if end < 0:
+                    if final:
+                        # Блок не закрыт до конца ответа: отдаём текст как есть.
+                        events.append(ContentEvent(TOOL_OPEN + self._pending))
+                        self._pending = ""
+                        self._in_call = False
+                    break
+                body = self._pending[:end]
+                self._pending = self._pending[end + len(TOOL_CLOSE) :]
+                self._in_call = False
+                events.append(self._finish_block(body))
+                continue
+
+            start = self._pending.find(TOOL_OPEN)
+            if start >= 0:
+                if start:
+                    events.append(ContentEvent(self._pending[:start]))
+                self._pending = self._pending[start + len(TOOL_OPEN) :]
+                self._in_call = True
+                continue
+
+            keep = 0 if final else _partial_tag_len(self._pending, TOOL_OPEN)
+            emit = self._pending[: len(self._pending) - keep]
+            if emit:
+                events.append(ContentEvent(emit))
+            self._pending = self._pending[len(self._pending) - keep :]
+            break
+        return events
+
+    def _finish_block(self, body: str) -> DetectorEvent:
+        parsed = parse_tool_call(body, self._specs)
+        if parsed is None:
+            log.warning("Модель вернула невалидный блок <tool_call>; он передан клиенту как текст.")
+            return ContentEvent(f"{TOOL_OPEN}{body}{TOOL_CLOSE}")
+        name, arguments = parsed
+        event = ToolCallEvent(
+            index=self.calls_emitted,
+            id=f"call_{uuid.uuid4().hex}",
+            name=name,
+            arguments=arguments,
+        )
+        self.calls_emitted += 1
+        return event
+
+
+def tool_call_object(event: ToolCallEvent) -> dict[str, Any]:
+    """Полный объект tool_calls для нестримингового ответа."""
+    return {
+        "id": event.id,
+        "type": "function",
+        "function": {"name": event.name, "arguments": event.arguments},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +799,9 @@ async def _sse_events(
     completion_id: str,
     created: int,
     model: str,
+    detector: ToolCallDetector,
 ) -> AsyncIterator[str]:
-    def chunk(delta: dict[str, Any], finish_reason: str | None = None) -> str:
+    def frame(delta: dict[str, Any], finish_reason: str | None = None) -> str:
         return _sse_frame(
             {
                 "id": completion_id,
@@ -472,20 +812,47 @@ async def _sse_events(
             }
         )
 
+    def render(events: list[DetectorEvent]) -> list[str]:
+        frames: list[str] = []
+        for event in events:
+            if isinstance(event, ContentEvent):
+                frames.append(frame({"content": event.text}))
+            else:
+                frames.append(
+                    frame(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": event.index,
+                                    "id": event.id,
+                                    "type": "function",
+                                    "function": {"name": event.name, "arguments": event.arguments},
+                                }
+                            ]
+                        }
+                    )
+                )
+        return frames
+
     try:
-        yield chunk({"role": "assistant", "content": ""})
+        yield frame({"role": "assistant", "content": ""})
         if first:
-            yield chunk({"content": first})
+            for chunk in render(detector.feed(first)):
+                yield chunk
         try:
             async for delta in deltas:
-                yield chunk({"content": delta})
+                for chunk in render(detector.feed(delta)):
+                    yield chunk
+            for chunk in render(detector.finish()):
+                yield chunk
         except Exception as exc:
             error = to_bridge_error(exc)
             # Заголовки 200 уже отправлены, поэтому ошибка передаётся внутри потока.
             yield _sse_frame({"error": {"message": error.message, "type": error.err_type}})
             yield "data: [DONE]\n\n"
             return
-        yield chunk({}, finish_reason="stop")
+        finish_reason = "tool_calls" if detector.calls_emitted else "stop"
+        yield frame({}, finish_reason=finish_reason)
         yield "data: [DONE]\n\n"
     finally:
         await deltas.aclose()
@@ -504,7 +871,7 @@ def create_app(settings: Settings) -> FastAPI:
         finally:
             await bridge.shutdown()
 
-    app = FastAPI(title="gemini-web-bridge", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="gemini-web-bridge", version="1.1.0", lifespan=lifespan)
     app.state.settings = settings
 
     async def require_api_key(request: Request) -> None:
@@ -553,17 +920,29 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
     async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any:
         bridge: GeminiBridge = request.app.state.bridge
-        prompt = build_prompt(body.messages)
+        plan = resolve_tools(body.tools, body.tool_choice)
+        prompt = build_prompt(body.messages, plan)
+        detector = ToolCallDetector(plan.specs if plan.enabled else None)
         model_name = body.model or settings.model
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         deltas = bridge.generate(prompt, body.model)
 
         if not body.stream:
+            events: list[DetectorEvent] = []
             try:
-                text = "".join([delta async for delta in deltas])
+                async for delta in deltas:
+                    events.extend(detector.feed(delta))
+                events.extend(detector.finish())
             except Exception as exc:
                 raise to_bridge_error(exc) from exc
+
+            text = "".join(event.text for event in events if isinstance(event, ContentEvent))
+            calls = [event for event in events if isinstance(event, ToolCallEvent)]
+            message: dict[str, Any] = {"role": "assistant", "content": text}
+            if calls:
+                message["content"] = text.strip() or None
+                message["tool_calls"] = [tool_call_object(call) for call in calls]
             return {
                 "id": completion_id,
                 "object": "chat.completion",
@@ -572,8 +951,8 @@ def create_app(settings: Settings) -> FastAPI:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
+                        "message": message,
+                        "finish_reason": "tool_calls" if calls else "stop",
                     }
                 ],
             }
@@ -586,7 +965,7 @@ def create_app(settings: Settings) -> FastAPI:
             raise to_bridge_error(exc) from exc
 
         return StreamingResponse(
-            _sse_events(deltas, first, completion_id, created, model_name),
+            _sse_events(deltas, first, completion_id, created, model_name, detector),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
