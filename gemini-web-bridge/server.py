@@ -905,6 +905,9 @@ def create_app(settings: Settings) -> FastAPI:
         }
         return JSONResponse(body, status_code=200 if bridge.ready else 503)
 
+    # Алиас для чекеров, которые опрашивают /health по привычке. Ответ тот же, что у /healthz.
+    app.add_api_route("/health", healthz, methods=["GET"])
+
     @app.get("/v1/models", dependencies=[Depends(require_api_key)])
     async def list_models(request: Request) -> dict[str, Any]:
         bridge: GeminiBridge = request.app.state.bridge

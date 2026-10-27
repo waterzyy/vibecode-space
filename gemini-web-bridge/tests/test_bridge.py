@@ -234,3 +234,8 @@ def test_defaults_are_applied(monkeypatch):
     assert settings.port == 8000
     assert (settings.delay_min, settings.delay_max) == (1.0, 2.5)
     assert settings.api_key is None
+
+
+def test_health_alias_matches_healthz(client):
+    assert client.get("/health").status_code == client.get("/healthz").status_code == 200
+    assert client.get("/health").json()["status"] == "ok"
